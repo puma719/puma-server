@@ -85,7 +85,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self):
-        self._send(204, {})
+        # 204 обязан быть БЕЗ тела, иначе iOS (WebKit) отбрасывает preflight
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Init-Data")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         self._send(200, {"ok": True}) if self.path == "/health" else self._send(404, {"error": "not found"})
@@ -93,6 +100,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         user_id = check_init_data(self.headers.get("X-Init-Data", ""))
         if not user_id:
+            print("AUTH FAIL: initData не прошла проверку. Скорее всего BOT_TOKEN неверный или от другого бота", flush=True)
             return self._send(401, {"error": "bad initData"})
         try:
             n = int(self.headers.get("Content-Length", "0"))
@@ -115,8 +123,12 @@ class Handler(BaseHTTPRequestHandler):
                     "currency": "XTR",
                     "prices": [{"label": "Звёзды", "amount": amount}],
                 })
-                return self._send(200, {"link": res["result"]}) if res.get("ok") else self._send(502, {"error": "telegram"})
-            except Exception:
+                if res.get("ok"):
+                    return self._send(200, {"link": res["result"]})
+                print("TELEGRAM ERROR:", res, flush=True)
+                return self._send(502, {"error": "telegram"})
+            except Exception as e:
+                print("INVOICE ERROR:", repr(e), flush=True)
                 return self._send(502, {"error": "telegram"})
 
         if self.path == "/api/claim":
@@ -171,5 +183,11 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         raise SystemExit("Задайте переменную BOT_TOKEN (токен от @BotFather)")
     threading.Thread(target=poll_loop, daemon=True).start()
-    print(f"Puma UP server on :{PORT}")
+    BOT_TOKEN = BOT_TOKEN.strip().strip('"').strip("'")
+    try:
+        me = tg_api("getMe")
+        print("BOT OK:", me.get("result", {}).get("username"), flush=True)
+    except Exception as e:
+        print("BOT TOKEN CHECK FAILED:", repr(e), flush=True)
+    print(f"Puma UP server on :{PORT}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
