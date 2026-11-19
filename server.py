@@ -4,7 +4,7 @@
 import hashlib, hmac, json, os, sqlite3, threading, time, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip('"').strip("'")
 APP_URL = os.environ.get("APP_URL", "https://puma719.github.io/puma-app/")
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://puma719.github.io")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -31,7 +31,10 @@ def tg_api(method, payload=None, timeout=30):
 
 
 def check_init_data(init_data, max_age=86400):
-    """Проверка подписи Telegram. Возвращает user_id или None."""
+    """Проверка подписи Telegram. Возвращает user_id или None (причина пишется в лог)."""
+    if not init_data:
+        print("AUTH FAIL: initData пустая (приложение открыто не из Telegram или не передало данные)", flush=True)
+        return None
     try:
         pairs = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
         got = pairs.pop("hash", "")
@@ -39,11 +42,15 @@ def check_init_data(init_data, max_age=86400):
         secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
         calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc, got):
+            print("AUTH FAIL: подпись не совпала. BOT_TOKEN неверный или приложение открыто через другого бота", flush=True)
             return None
-        if time.time() - int(pairs.get("auth_date", "0")) > max_age:
+        age = time.time() - int(pairs.get("auth_date", "0"))
+        if age > max_age:
+            print(f"AUTH FAIL: initData устарела ({int(age // 3600)} ч). Нужно закрыть и заново открыть приложение", flush=True)
             return None
         return int(json.loads(pairs["user"])["id"])
-    except Exception:
+    except Exception as e:
+        print("AUTH FAIL: не удалось разобрать initData:", repr(e), flush=True)
         return None
 
 
@@ -106,7 +113,6 @@ class Handler(BaseHTTPRequestHandler):
         init_data = body.get("initData") or self.headers.get("X-Init-Data", "")
         user_id = check_init_data(init_data)
         if not user_id:
-            print("AUTH FAIL: initData не прошла проверку. Скорее всего BOT_TOKEN неверный или от другого бота", flush=True)
             return self._send(401, {"error": "bad initData"})
 
         if self.path == "/api/invoice":
@@ -184,7 +190,6 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         raise SystemExit("Задайте переменную BOT_TOKEN (токен от @BotFather)")
     threading.Thread(target=poll_loop, daemon=True).start()
-    BOT_TOKEN = BOT_TOKEN.strip().strip('"').strip("'")
     try:
         me = tg_api("getMe")
         print("BOT OK:", me.get("result", {}).get("username"), flush=True)
