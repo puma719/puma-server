@@ -16,8 +16,71 @@ db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.executescript("""
 CREATE TABLE IF NOT EXISTS payments(charge_id TEXT PRIMARY KEY, user_id INTEGER, amount INTEGER, ts INTEGER);
 CREATE TABLE IF NOT EXISTS credits(user_id INTEGER PRIMARY KEY, pending INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS promo_codes(code TEXT PRIMARY KEY, min_dep INTEGER NOT NULL DEFAULT 0,
+                                       reward INTEGER NOT NULL, max_uses INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS promo_used(user_id INTEGER, code TEXT, ts INTEGER, PRIMARY KEY(user_id, code));
 """)
 db.commit()
+
+
+def seed_promos():
+    """Промокоды берутся из переменной PROMOS (в коде их нет, репозиторий публичный).
+    Формат: КОД:мин_пополнение:награда:сколько_активаций, через запятую.
+    Пример: FREE5:0:10:5,DEP100:100:20:5,DEP1000:1000:100:5
+    Счётчик использований при перезапуске не сбрасывается (если база лежит на постоянном томе)."""
+    for item in os.environ.get("PROMOS", "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            code, min_dep, reward, max_uses = item.split(":")
+            row = (code.strip().upper(), int(min_dep), int(reward), int(max_uses))
+        except Exception:
+            print("PROMOS: пропущен неверный элемент:", item[:40], flush=True)
+            continue
+        with _db_lock:
+            db.execute("INSERT INTO promo_codes(code,min_dep,reward,max_uses) VALUES(?,?,?,?) "
+                       "ON CONFLICT(code) DO UPDATE SET min_dep=excluded.min_dep, reward=excluded.reward, max_uses=excluded.max_uses", row)
+            db.commit()
+        print("PROMO OK:", row[0], flush=True)
+
+
+_promo_fails = {}
+
+
+def redeem_promo(user_id, code):
+    """Возвращает (награда, ошибка). Всё под одной блокировкой, чтобы лимит не обошли параллельными запросами."""
+    now = time.time()
+    fails = [t for t in _promo_fails.get(user_id, []) if now - t < 3600]
+    if len(fails) >= 10:
+        return 0, "Слишком много попыток, попробуйте позже"
+
+    def fail(msg, count=True):
+        if count:
+            fails.append(now)
+            _promo_fails[user_id] = fails
+        return 0, msg
+
+    code = str(code or "").strip().upper()[:40]
+    if not code:
+        return fail("Введите код", False)
+    with _db_lock:
+        row = db.execute("SELECT min_dep,reward,max_uses,uses FROM promo_codes WHERE code=?", (code,)).fetchone()
+        if not row:
+            return fail("Такого кода нет")
+        min_dep, reward, max_uses, uses = row
+        if db.execute("SELECT 1 FROM promo_used WHERE user_id=? AND code=?", (user_id, code)).fetchone():
+            return fail("Код уже использован вами", False)
+        if uses >= max_uses:
+            return fail("Код уже активировали максимальное число раз", False)
+        if min_dep:
+            dep = db.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE user_id=?", (user_id,)).fetchone()[0]
+            if dep < min_dep:
+                return fail(f"Нужно пополнить минимум на {min_dep} ⭐ (у вас {dep})", False)
+        db.execute("INSERT INTO promo_used VALUES(?,?,?)", (user_id, code, int(now)))
+        db.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=?", (code,))
+        db.commit()
+        return reward, ""
 
 
 def tg_api(method, payload=None, timeout=30):
@@ -139,6 +202,12 @@ class Handler(BaseHTTPRequestHandler):
                 print("INVOICE ERROR:", repr(e), flush=True)
                 return self._send(502, {"error": "telegram"})
 
+        if self.path == "/api/promo":
+            reward, err = redeem_promo(user_id, body.get("code"))
+            if reward:
+                return self._send(200, {"reward": reward})
+            return self._send(400, {"error": err})
+
         if self.path == "/api/claim":
             return self._send(200, {"credited": claim(user_id)})
 
@@ -190,6 +259,7 @@ def poll_loop():
 if __name__ == "__main__":
     if not BOT_TOKEN:
         raise SystemExit("Задайте переменную BOT_TOKEN (токен от @BotFather)")
+    seed_promos()
     threading.Thread(target=poll_loop, daemon=True).start()
     try:
         me = tg_api("getMe")
