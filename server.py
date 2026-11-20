@@ -31,10 +31,12 @@ def tg_api(method, payload=None, timeout=30):
 
 
 def check_init_data(init_data, max_age=86400):
-    """Проверка подписи Telegram. Возвращает user_id или None (причина пишется в лог)."""
+    """Проверка подписи Telegram. Возвращает (user_id, причина): при успехе (id, ""), при отказе (None, текст)."""
+    def fail(msg, detail=""):
+        print("AUTH FAIL:", detail or msg, flush=True)
+        return None, msg
     if not init_data:
-        print("AUTH FAIL: initData пустая (приложение открыто не из Telegram или не передало данные)", flush=True)
-        return None
+        return fail("initData пустая", "initData пустая (приложение открыто не из Telegram или не передало данные)")
     try:
         pairs = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
         got = pairs.pop("hash", "")
@@ -42,16 +44,15 @@ def check_init_data(init_data, max_age=86400):
         secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
         calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc, got):
-            print("AUTH FAIL: подпись не совпала. BOT_TOKEN неверный или приложение открыто через другого бота", flush=True)
-            return None
+            return fail("подпись не совпала (BOT_TOKEN не от этого бота?)",
+                        "подпись не совпала. BOT_TOKEN неверный или приложение открыто через другого бота")
         age = time.time() - int(pairs.get("auth_date", "0"))
         if age > max_age:
-            print(f"AUTH FAIL: initData устарела ({int(age // 3600)} ч). Нужно закрыть и заново открыть приложение", flush=True)
-            return None
-        return int(json.loads(pairs["user"])["id"])
+            return fail(f"initData устарела ({int(age // 3600)} ч)",
+                        f"initData устарела ({int(age // 3600)} ч). Нужно закрыть и заново открыть приложение")
+        return int(json.loads(pairs["user"])["id"]), ""
     except Exception as e:
-        print("AUTH FAIL: не удалось разобрать initData:", repr(e), flush=True)
-        return None
+        return fail("не удалось разобрать initData", "не удалось разобрать initData: " + repr(e))
 
 
 def add_payment(charge_id, user_id, amount):
@@ -111,9 +112,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error": "bad json"})
         init_data = body.get("initData") or self.headers.get("X-Init-Data", "")
-        user_id = check_init_data(init_data)
+        user_id, reason = check_init_data(init_data)
         if not user_id:
-            return self._send(401, {"error": "bad initData"})
+            return self._send(401, {"error": "bad initData: " + reason})
 
         if self.path == "/api/invoice":
             try:
