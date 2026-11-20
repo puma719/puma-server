@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS promo_codes(code TEXT PRIMARY KEY, min_dep INTEGER NO
                                        reward INTEGER NOT NULL, max_uses INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS promo_used(user_id INTEGER, code TEXT, ts INTEGER, PRIMARY KEY(user_id, code));
 CREATE TABLE IF NOT EXISTS raffle_joins(raffle_id TEXT, cycle INTEGER, user_id INTEGER, ts INTEGER, PRIMARY KEY(raffle_id, cycle, user_id));
+CREATE TABLE IF NOT EXISTS nft_deposits(dep_key TEXT PRIMARY KEY, user_id INTEGER, name TEXT, base_name TEXT, num INTEGER, model TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS feed(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, item TEXT, ts INTEGER);
 """)
 db.commit()
@@ -175,6 +177,72 @@ def tg_api(method, payload=None, timeout=30):
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+
+# ---------- NFT: приём подарков через бизнес-аккаунт ----------
+# Игрок отправляет NFT-подарок на Telegram-аккаунт, подключённый к боту (Настройки → Telegram для бизнеса → Чат-боты).
+# Telegram присылает боту service-сообщение unique_gift, и бот сразу записывает NFT на профиль отправителя.
+def kv_set(k, v):
+    with _db_lock:
+        db.execute("INSERT INTO kv VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+        db.commit()
+
+
+def kv_get(k, default=""):
+    with _db_lock:
+        row = db.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    return row[0] if row else default
+
+
+def deposit_account():
+    """@username аккаунта, на который нужно отправлять NFT (из NFT_ACCOUNT или из подключения бизнес-аккаунта)."""
+    return os.environ.get("NFT_ACCOUNT", "").strip() or kv_get("biz_username")
+
+
+def nft_list(user_id):
+    with _db_lock:
+        rows = db.execute("SELECT name,base_name,num,model,ts FROM nft_deposits WHERE user_id=? ORDER BY ts DESC LIMIT 100",
+                          (user_id,)).fetchall()
+    return [{"name": n, "base": b, "num": k, "model": m, "ts": t} for n, b, k, m, t in rows]
+
+
+def handle_business_connection(bc):
+    """Запоминаем аккаунт, к которому подключён бот: именно туда игроки отправляют NFT."""
+    u = bc.get("user") or {}
+    if bc.get("is_enabled", True) and u.get("username"):
+        kv_set("biz_username", "@" + u["username"])
+        kv_set("biz_owner_id", u.get("id", 0))
+    print("BUSINESS CONNECTION:", u.get("username") or u.get("id"), "enabled:", bc.get("is_enabled"), flush=True)
+
+
+def handle_business_message(m):
+    """Входящий NFT: зачисляется отправителю подарка. Свои подарки владельца аккаунта и обычные (не NFT) подарки не считаются."""
+    ug = m.get("unique_gift")
+    if not ug:
+        return
+    sender = (m.get("from") or {}).get("id")
+    chat_id = (m.get("chat") or {}).get("id")
+    # подарок получен от собеседника, а не отправлен им самим владельцем аккаунта
+    if not sender or sender != chat_id or str(sender) == str(kv_get("biz_owner_id")):
+        return
+    g = ug.get("gift") or {}
+    key = ug.get("owned_gift_id") or f"{m.get('business_connection_id')}:{chat_id}:{m.get('message_id')}"
+    name = str(g.get("name") or g.get("base_name") or "NFT")[:80]
+    base = str(g.get("base_name") or name)[:80]
+    num = int(g.get("number") or 0)
+    model = str((g.get("model") or {}).get("name") or "")[:80]
+    with _db_lock:
+        try:
+            db.execute("INSERT INTO nft_deposits VALUES(?,?,?,?,?,?,?)", (key, sender, name, base, num, model, int(time.time())))
+            db.commit()
+        except sqlite3.IntegrityError:
+            return  # этот подарок уже зачислен
+    print("NFT DEPOSIT:", sender, name, num, flush=True)
+    try:
+        tg_api("sendMessage", {"chat_id": sender, "text": f"🎁 NFT получен: {base} #{num}. Он уже в вашем профиле в приложении.",
+                               "reply_markup": {"inline_keyboard": [[{"text": "Открыть", "web_app": {"url": APP_URL}}]]}})
+    except Exception as e:
+        print("nft notify error:", repr(e), flush=True)
 
 
 _sub_ok = {}  # user_id -> время последней успешной проверки (кэш 60 с, чтобы не долбить Telegram)
@@ -331,6 +399,9 @@ class Handler(BaseHTTPRequestHandler):
             ok, err = is_subscribed(user_id)
             return self._send(200, {"subscribed": ok, "channel": SUB_CHANNEL, "error": err})
 
+        if self.path == "/api/nfts":
+            return self._send(200, {"items": nft_list(user_id), "account": deposit_account()})
+
         if self.path == "/api/promo":
             reward, err = redeem_promo(user_id, body.get("code"))
             if reward:
@@ -354,6 +425,12 @@ def handle_update(u):
         tg_api("answerPreCheckoutQuery", {"pre_checkout_query_id": pcq["id"], "ok": ok,
                                           **({} if ok else {"error_message": "Платёж отклонён"})})
         return
+    if u.get("business_connection"):
+        handle_business_connection(u["business_connection"])
+        return
+    if u.get("business_message"):
+        handle_business_message(u["business_message"])
+        return
     m = u.get("message") or {}
     sp = m.get("successful_payment")
     if sp:
@@ -373,7 +450,7 @@ def poll_loop():
     while True:
         try:
             res = tg_api("getUpdates", {"offset": offset, "timeout": 25,
-                                        "allowed_updates": ["message", "pre_checkout_query"]}, timeout=40)
+                                        "allowed_updates": ["message", "pre_checkout_query", "business_connection", "business_message"]}, timeout=40)
             for u in res.get("result", []):
                 offset = u["update_id"] + 1
                 try:
