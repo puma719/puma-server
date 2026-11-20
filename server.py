@@ -1,7 +1,7 @@
 """Puma UP — сервер бота: приём оплаты Telegram Stars (XTR).
 Только стандартная библиотека Python 3.9+. Запуск:  BOT_TOKEN=... python3 server.py
 """
-import hashlib, hmac, json, os, re, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
+import hashlib, hmac, json, math, os, re, secrets, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip('"').strip("'")
@@ -13,6 +13,9 @@ MIN_STARS, MAX_STARS = 1, 100000
 # Канал, подписка на который нужна для бесплатного кейса. Бот должен быть АДМИНИСТРАТОРОМ этого канала,
 # иначе Telegram не отдаёт список подписчиков и проверка не сработает.
 SUB_CHANNEL = os.environ.get("SUB_CHANNEL", "@pumaup").strip()
+# Принимаем и «pumaup», и «https://t.me/pumaup», и числовой id канала (-100...)
+SUB_CHANNEL = re.sub(r"^(https?://)?t\.me/", "", SUB_CHANNEL).lstrip("@")
+SUB_CHANNEL = SUB_CHANNEL if re.fullmatch(r"-?\d+", SUB_CHANNEL) else "@" + SUB_CHANNEL
 
 _db_lock = threading.Lock()
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -26,6 +29,10 @@ CREATE TABLE IF NOT EXISTS raffle_joins(raffle_id TEXT, cycle INTEGER, user_id I
 CREATE TABLE IF NOT EXISTS nft_deposits(dep_key TEXT PRIMARY KEY, user_id INTEGER, name TEXT, base_name TEXT, num INTEGER, model TEXT, ts INTEGER);
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS feed(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, item TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS mp_rounds(id INTEGER PRIMARY KEY AUTOINCREMENT, game TEXT, x REAL, ts INTEGER);
+CREATE TABLE IF NOT EXISTS mp_bets(id INTEGER PRIMARY KEY AUTOINCREMENT, game TEXT, round INTEGER, user_id INTEGER, name TEXT,
+                                   bet INTEGER, pick INTEGER, cash REAL, x REAL, ts INTEGER);
+CREATE INDEX IF NOT EXISTS mp_bets_user ON mp_bets(user_id, game, id);
 """)
 db.commit()
 
@@ -132,6 +139,225 @@ def feed(user_id, name, item=None):
             db.commit()
         rows = db.execute("SELECT user_id,name,item FROM feed ORDER BY id DESC LIMIT 14").fetchall()
     return [{"n": n, "item": it, "me": uid == user_id} for uid, n, it in rows]
+
+
+# ---------- Мультиплеер: общие раунды Ракеты и Скачек ----------
+# Раунды ведёт сервер: у всех игроков один раунд, один множитель, одни и те же ставки.
+# Состояние считается по часам при каждом запросе, отдельный поток не нужен.
+MP_GAMES = ("rocket", "race")
+MP_BET_MAX, MP_BANK_MAX = 15000, 15000      # как BET_MAX и BANK_MAX в приложении
+RK_RTP, RK_RATE = 90, 0.09                  # возврат игрокам, % и рост множителя exp(0.09 * t)
+RK_WAIT, RK_CRASH = 5.0, 2.5                # приём ставок и показ взрыва, секунд
+HR_WAIT, HR_RUN, HR_DONE, HR_MULT = 8.0, 7.0, 3.5, 3.8
+_mp_lock = threading.RLock()
+_mp = {g: {"round": 0, "phase": "wait", "t0": 0.0, "cp": 1.0, "win": 0, "seed": 0, "bets": {}, "prev": None, "hist": []}
+       for g in MP_GAMES}
+_mp_my = {}  # (игра, user_id) -> последние 10 ставок игрока, новые первыми
+
+
+def player_name(init_data):
+    """Имя для списка ставок: имя из Telegram без @username (из подписанных данных, не от клиента)."""
+    try:
+        u = json.loads(dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))["user"])
+        return (str(u.get("first_name") or "").strip() or str(u.get("username") or "").strip() or "Игрок")[:24]
+    except Exception:
+        return "Игрок"
+
+
+def mp_load_history():
+    """После перезапуска сервера подтягиваем историю иксов и победителей из базы."""
+    with _mp_lock:
+        for g in MP_GAMES:
+            with _db_lock:
+                rows = db.execute("SELECT x FROM mp_rounds WHERE game=? ORDER BY id DESC LIMIT 15", (g,)).fetchall()
+            _mp[g]["hist"] = [round(r[0], 2) if g == "rocket" else int(r[0]) for r in rows]
+
+
+def _rk_crash_point():
+    r = secrets.randbelow(10 ** 9) / 10 ** 9
+    return min(500.0, max(1.0, math.floor(RK_RTP / (1 - r)) / 100))
+
+
+def _mp_new_round(g, now):
+    s = _mp[g]
+    s.update(round=max(s["round"] + 1, int(now * 1000)), phase="wait", t0=now, bets={})
+    if g == "rocket":
+        s["cp"] = _rk_crash_point()  # точка взрыва известна только серверу и уходит клиентам после взрыва
+    else:
+        s["win"], s["seed"] = secrets.randbelow(4), secrets.randbelow(2 ** 31)
+
+
+def _mp_end(g, s):
+    """Когда закончится текущая фаза раунда (время сервера, секунды)."""
+    ph = s["phase"]
+    if g == "rocket":
+        if ph == "wait":
+            return s["t0"] + RK_WAIT
+        if ph == "fly":
+            return s["t0"] + math.log(s["cp"]) / RK_RATE
+        return s["t0"] + RK_CRASH
+    return s["t0"] + (HR_WAIT if ph == "wait" else HR_RUN if ph == "run" else HR_DONE)
+
+
+def _mp_my_list(g, uid):
+    lst = _mp_my.get((g, uid))
+    if lst is None:
+        with _db_lock:
+            rows = db.execute("SELECT bet,pick,cash,x,ts FROM mp_bets WHERE game=? AND user_id=? ORDER BY id DESC LIMIT 10",
+                              (g, uid)).fetchall()
+        lst = [{"bet": r[0], "pick": r[1], "cash": r[2], "x": round(r[3], 2) if g == "rocket" else int(r[3]), "ts": r[4]}
+               for r in rows]
+        if len(_mp_my) > 5000:
+            _mp_my.clear()
+        _mp_my[(g, uid)] = lst
+    return lst
+
+
+def _mp_pub(g, b, me):
+    o = {"n": b["name"], "bet": b["bet"], "me": bool(me)}
+    if g == "race":
+        o["pick"] = b["pick"]
+    else:
+        o["cash"] = b["cash"]
+    return o
+
+
+def _mp_settle(g, s):
+    """Раунд закончился: пишем результат и ставки в базу, обновляем историю."""
+    x = round(s["cp"], 2) if g == "rocket" else s["win"]
+    ts = int(s["t0"])
+    bets = sorted(s["bets"].items(), key=lambda kv: -kv[1]["bet"])
+    s["prev"] = {"round": s["round"], "x": x, "bets": [dict(_mp_pub(g, b, False), u=uid) for uid, b in bets]}
+    s["hist"].insert(0, x)
+    del s["hist"][15:]
+    for uid, b in bets:
+        lst = _mp_my_list(g, uid)
+        lst.insert(0, {"bet": b["bet"], "pick": b["pick"], "cash": b["cash"], "x": x, "ts": ts})
+        del lst[10:]
+    with _db_lock:
+        db.execute("INSERT INTO mp_rounds(game,x,ts) VALUES(?,?,?)", (g, x, ts))
+        if bets:
+            db.executemany("INSERT INTO mp_bets(game,round,user_id,name,bet,pick,cash,x,ts) VALUES(?,?,?,?,?,?,?,?,?)",
+                           [(g, s["round"], uid, b["name"], b["bet"], b["pick"], b["cash"], x, ts) for uid, b in bets])
+        db.execute("DELETE FROM mp_rounds WHERE game=? AND id NOT IN (SELECT id FROM mp_rounds WHERE game=? ORDER BY id DESC LIMIT 200)", (g, g))
+        db.commit()
+
+
+def _mp_advance(g, now):
+    """Двигает раунд по часам: ставки, полёт/гонка, взрыв/финиш, новый раунд."""
+    s = _mp[g]
+    if not s["round"]:
+        _mp_new_round(g, now)
+        return
+    for _ in range(8):
+        end = _mp_end(g, s)
+        if now < end:
+            return
+        ph = s["phase"]
+        if ph == "wait":
+            s.update(phase="fly" if g == "rocket" else "run", t0=end)
+        elif ph in ("fly", "run"):
+            s.update(phase="crash" if g == "rocket" else "done", t0=end)
+            _mp_settle(g, s)
+        else:
+            _mp_new_round(g, end)
+    if now >= _mp_end(g, s):  # сервер долго никто не опрашивал — начинаем заново с текущего момента
+        _mp_new_round(g, now)
+
+
+def mp_state(user_id, g):
+    with _mp_lock:
+        now = time.time()
+        _mp_advance(g, now)
+        s = _mp[g]
+        ph = s["phase"]
+        out = {"now": int(now * 1000), "game": g, "round": s["round"], "phase": ph, "t0": int(s["t0"] * 1000),
+               "wait": int((RK_WAIT if g == "rocket" else HR_WAIT) * 1000), "hist": list(s["hist"])}
+        if g == "rocket":
+            if ph == "crash":
+                out["cp"] = round(s["cp"], 2)
+            if ph != "fly":  # момент взрыва во время полёта не раскрываем
+                out["ends"] = int(_mp_end(g, s) * 1000)
+        else:
+            out["mult"] = HR_MULT
+            if ph in ("run", "done"):  # победитель известен только после закрытия ставок
+                out["win"], out["seed"] = s["win"], s["seed"]
+            out["ends"] = int(_mp_end(g, s) * 1000)
+        bets = sorted(s["bets"].items(), key=lambda kv: -kv[1]["bet"])
+        out["bets"] = [_mp_pub(g, b, uid == user_id) for uid, b in bets]
+        mine = s["bets"].get(user_id)
+        out["mine"] = _mp_pub(g, mine, True) if mine else None
+        prev = s["prev"]
+        out["prev"] = None if not prev else {"round": prev["round"], "x": prev["x"],
+                                             "bets": [{k: v for k, v in b.items() if k != "u"} | {"me": b["u"] == user_id} for b in prev["bets"]]}
+        out["my"] = [dict(r) for r in _mp_my_list(g, user_id)]
+    out["online"] = online(user_id, g).get(g, 0)
+    return out
+
+
+def mp_bet(user_id, name, g, amount, pick):
+    try:
+        amount = int(amount)
+        pick = int(pick or 0)
+    except Exception:
+        return {"error": "Неверная ставка"}
+    if amount < 1:
+        return {"error": "Введите ставку"}
+    if amount > MP_BET_MAX:
+        return {"error": f"Максимальная ставка: {MP_BET_MAX} ⭐"}
+    if g == "race" and not 0 <= pick <= 3:
+        return {"error": "Выберите пуму"}
+    with _mp_lock:
+        _mp_advance(g, time.time())
+        s = _mp[g]
+        if s["phase"] != "wait":
+            return {"error": "Ставки закрыты, дождитесь следующего раунда"}
+        if user_id in s["bets"]:
+            return {"error": "Ставка уже сделана"}
+        bank = sum(b["bet"] for b in s["bets"].values())
+        if bank + amount > MP_BANK_MAX:
+            left = max(0, MP_BANK_MAX - bank)
+            return {"error": f"Банк раунда ограничен {MP_BANK_MAX} ⭐. Можно поставить до {left}" if left else f"Банк раунда заполнен ({MP_BANK_MAX} ⭐)"}
+        s["bets"][user_id] = {"name": name, "bet": amount, "pick": pick if g == "race" else 0, "cash": None}
+        return {"ok": True, "round": s["round"]}
+
+
+def mp_cancel(user_id, g):
+    with _mp_lock:
+        _mp_advance(g, time.time())
+        s = _mp[g]
+        if user_id not in s["bets"]:
+            return {"ok": True}
+        if s["phase"] != "wait":
+            return {"error": "Ставки уже закрыты"}
+        del s["bets"][user_id]
+        return {"ok": True}
+
+
+def mp_cash(user_id, at):
+    """Забрать выигрыш в Ракете. Множитель считает сервер по своим часам: «at» — это то, что игрок видел на экране
+    (или его автовывод), оно принимается только если не больше реального множителя в этот момент."""
+    with _mp_lock:
+        now = time.time()
+        _mp_advance("rocket", now)
+        s = _mp["rocket"]
+        b = s["bets"].get(user_id)
+        if not b:
+            return {"error": "Нет ставки в этом раунде"}
+        if b["cash"] is not None:
+            return {"ok": True, "m": b["cash"], "again": True}  # ответ потерялся — отдаём тот же результат
+        if s["phase"] != "fly":
+            return {"error": "late"}
+        m = math.exp(RK_RATE * (now - s["t0"]))
+        if m >= s["cp"]:
+            return {"error": "late"}
+        try:
+            at = float(at or 0)
+        except Exception:
+            at = 0.0
+        use = at if 1.0 <= at <= m else m
+        b["cash"] = max(1.0, math.floor(use * 100) / 100)
+        return {"ok": True, "m": b["cash"]}
 
 
 def redeem_promo(user_id, code):
@@ -255,6 +481,34 @@ def credit_nft(key, user_id, name, base, num, model):
 
 
 _sub_ok = {}  # user_id -> время последней успешной проверки (кэш 60 с, чтобы не долбить Telegram)
+# Состояние проверки подписки для диагностики: видно в логах и на /health (ok / bot_not_admin / error + причина).
+SUB_DIAG = {"status": "unknown", "detail": ""}
+
+
+def sub_diagnose():
+    """Проверка при старте. Telegram отдаёт статус участников канала только боту-администратору этого канала.
+    Если бот не админ или канал указан неверно, подписка у игроков не проверится: причина пишется в лог."""
+    try:
+        me = tg_api("getMe")["result"]["id"]
+        res = tg_api("getChatMember", {"chat_id": SUB_CHANNEL, "user_id": me}, timeout=10)
+        st = (res.get("result") or {}).get("status")
+        if st in ("administrator", "creator"):
+            SUB_DIAG.update(status="ok", detail="")
+        else:
+            SUB_DIAG.update(status="bot_not_admin", detail=f"бот в канале {SUB_CHANNEL} со статусом «{st}»")
+    except urllib.error.HTTPError as e:
+        try:
+            desc = json.loads(e.read()).get("description", "")
+        except Exception:
+            desc = ""
+        SUB_DIAG.update(status="error", detail=f"{e.code} {desc}".strip())
+    except Exception as e:
+        SUB_DIAG.update(status="error", detail=repr(e))
+    if SUB_DIAG["status"] == "ok":
+        print("SUB CHECK OK: бот администратор канала", SUB_CHANNEL, flush=True)
+    else:
+        print(f"SUB CHECK FAILED ({SUB_DIAG['status']}): {SUB_DIAG['detail']}. Добавьте бота АДМИНИСТРАТОРОМ в канал "
+              f"{SUB_CHANNEL} (достаточно любых прав) и проверьте переменную SUB_CHANNEL.", flush=True)
 
 
 def is_subscribed(user_id):
@@ -270,15 +524,18 @@ def is_subscribed(user_id):
             desc = json.loads(e.read()).get("description", "")
         except Exception:
             desc = ""
-        print("SUB CHECK ERROR:", e.code, desc, flush=True)
+        print("SUB CHECK ERROR:", e.code, desc, "| канал:", SUB_CHANNEL, flush=True)
         if "user not found" in desc.lower() or "participant_id_invalid" in desc.lower():
             return False, ""  # Telegram не знает такого участника — считаем неподписанным
+        SUB_DIAG.update(status="error", detail=f"{e.code} {desc}".strip())
         return False, "Не удалось проверить подписку, попробуйте позже"
     except Exception as e:
         print("SUB CHECK ERROR:", repr(e), flush=True)
+        SUB_DIAG.update(status="error", detail=repr(e))
         return False, "Не удалось проверить подписку, попробуйте позже"
     r = res.get("result") or {}
     st = r.get("status")
+    SUB_DIAG.update(status="ok", detail="")  # Telegram ответил — проверка работает
     ok = st in ("creator", "administrator", "member") or (st == "restricted" and bool(r.get("is_member")))
     if ok:
         _sub_ok[user_id] = now
@@ -358,7 +615,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        self._send(200, {"ok": True}) if self.path == "/health" else self._send(404, {"error": "not found"})
+        if self.path == "/health":
+            return self._send(200, {"ok": True, "sub": SUB_DIAG["status"], "sub_detail": SUB_DIAG["detail"]})
+        self._send(404, {"error": "not found"})
 
     def do_POST(self):
         try:
@@ -408,6 +667,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 print("INVOICE ERROR:", repr(e), flush=True)
                 return self._send(502, {"error": "telegram"})
+
+        if self.path.startswith("/api/mp/"):
+            g = str(body.get("game") or "")
+            if g not in MP_GAMES:
+                return self._send(400, {"error": "bad game"})
+            act = self.path[len("/api/mp/"):]
+            if act == "state":
+                return self._send(200, mp_state(user_id, g))
+            if act == "bet":
+                return self._send(200, mp_bet(user_id, player_name(init_data), g, body.get("amount"), body.get("pick")))
+            if act == "cancel":
+                return self._send(200, mp_cancel(user_id, g))
+            if act == "cash" and g == "rocket":
+                return self._send(200, mp_cash(user_id, body.get("at")))
+            return self._send(404, {"error": "not found"})
 
         if self.path == "/api/online":
             return self._send(200, {"counts": online(user_id, body.get("game"))})
@@ -490,7 +764,9 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         raise SystemExit("Задайте переменную BOT_TOKEN (токен от @BotFather)")
     seed_promos()
+    mp_load_history()
     threading.Thread(target=poll_loop, daemon=True).start()
+    threading.Thread(target=sub_diagnose, daemon=True).start()
     try:
         me = tg_api("getMe")
         print("BOT OK:", me.get("result", {}).get("username"), flush=True)
