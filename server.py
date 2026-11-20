@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS credits(user_id INTEGER PRIMARY KEY, pending INTEGER 
 CREATE TABLE IF NOT EXISTS promo_codes(code TEXT PRIMARY KEY, min_dep INTEGER NOT NULL DEFAULT 0,
                                        reward INTEGER NOT NULL, max_uses INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS promo_used(user_id INTEGER, code TEXT, ts INTEGER, PRIMARY KEY(user_id, code));
+CREATE TABLE IF NOT EXISTS raffle_joins(raffle_id TEXT, cycle INTEGER, user_id INTEGER, ts INTEGER, PRIMARY KEY(raffle_id, cycle, user_id));
 CREATE TABLE IF NOT EXISTS feed(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, item TEXT, ts INTEGER);
 """)
 db.commit()
@@ -47,6 +48,58 @@ def seed_promos():
 
 
 _promo_fails = {}
+
+# ---------- Розыгрыши: реальные участники ----------
+# id: (минимальное пополнение Stars, длительность круга в секундах). Должно совпадать с RAFFLES в приложении.
+RAFFLES = {"r1": (0, 3 * 3600), "r2": (100, 26 * 3600), "r3": (500, 72 * 3600)}
+
+
+def raffles(user_id, join=None):
+    """Участие в текущем круге розыгрыша. Круги общие для всех: номер круга = время // длительность."""
+    now = time.time()
+    err = ""
+    with _db_lock:
+        if join is not None:
+            if join not in RAFFLES:
+                err = "Такого розыгрыша нет"
+            else:
+                req, cyc = RAFFLES[join]
+                dep = db.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE user_id=?", (user_id,)).fetchone()[0]
+                if dep < req:
+                    err = f"Нужно пополнить минимум на {req} ⭐ (у вас {dep})"
+                else:
+                    db.execute("INSERT OR IGNORE INTO raffle_joins VALUES(?,?,?,?)", (join, int(now // cyc), user_id, int(now)))
+                    db.commit()
+        out = {}
+        for rid, (req, cyc) in RAFFLES.items():
+            c = int(now // cyc)
+            n = db.execute("SELECT COUNT(*) FROM raffle_joins WHERE raffle_id=? AND cycle=?", (rid, c)).fetchone()[0]
+            j = db.execute("SELECT 1 FROM raffle_joins WHERE raffle_id=? AND cycle=? AND user_id=?", (rid, c, user_id)).fetchone()
+            out[rid] = {"n": n, "joined": j is not None}
+    return out, err
+
+
+# ---------- Сколько игроков сейчас в каждой игре ----------
+GAME_IDS = ("upgrade", "mines", "rocket", "tower", "race", "peaks")
+_presence = {}
+
+
+def online(user_id, game=None):
+    """Игрок считается «играющим», если за последние 40 секунд сообщил, что находится в игре."""
+    now = time.time()
+    with _db_lock:
+        for d in _presence.values():
+            d.pop(user_id, None)
+        if game in GAME_IDS:
+            _presence.setdefault(game, {})[user_id] = now
+        counts = {}
+        for g in GAME_IDS:
+            d = _presence.setdefault(g, {})
+            for u in [u for u, t in d.items() if now - t > 40]:
+                del d[u]
+            counts[g] = len(d)
+    return counts
+
 
 # ---------- Лента LIVE: реальные выигрыши игроков ----------
 _feed_last = {}
@@ -229,6 +282,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 print("INVOICE ERROR:", repr(e), flush=True)
                 return self._send(502, {"error": "telegram"})
+
+        if self.path == "/api/online":
+            return self._send(200, {"counts": online(user_id, body.get("game"))})
+
+        if self.path == "/api/raffles":
+            out, err = raffles(user_id, body.get("join"))
+            return self._send(200, {"raffles": out, "error": err})
 
         if self.path == "/api/feed":
             return self._send(200, {"items": feed(user_id, user_display(init_data), body.get("item"))})
