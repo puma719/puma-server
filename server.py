@@ -227,22 +227,31 @@ def handle_business_message(m):
         return
     g = ug.get("gift") or {}
     key = ug.get("owned_gift_id") or f"{m.get('business_connection_id')}:{chat_id}:{m.get('message_id')}"
-    name = str(g.get("name") or g.get("base_name") or "NFT")[:80]
-    base = str(g.get("base_name") or name)[:80]
-    num = int(g.get("number") or 0)
-    model = str((g.get("model") or {}).get("name") or "")[:80]
+    credit_nft(key, sender, g.get("name") or g.get("base_name"), g.get("base_name"), g.get("number"), (g.get("model") or {}).get("name"))
+
+
+def credit_nft(key, user_id, name, base, num, model):
+    """Записывает NFT на профиль игрока (один раз на ключ) и пишет ему в личку. Возвращает True, если зачислено."""
+    name = str(name or base or "NFT")[:80]
+    base = str(base or name)[:80]
+    try:
+        num = int(num or 0)
+    except Exception:
+        num = 0
+    model = str(model or "")[:80]
     with _db_lock:
         try:
-            db.execute("INSERT INTO nft_deposits VALUES(?,?,?,?,?,?,?)", (key, sender, name, base, num, model, int(time.time())))
+            db.execute("INSERT INTO nft_deposits VALUES(?,?,?,?,?,?,?)", (str(key)[:200], user_id, name, base, num, model, int(time.time())))
             db.commit()
         except sqlite3.IntegrityError:
-            return  # этот подарок уже зачислен
-    print("NFT DEPOSIT:", sender, name, num, flush=True)
+            return False  # этот подарок уже зачислен
+    print("NFT DEPOSIT:", user_id, name, num, flush=True)
     try:
-        tg_api("sendMessage", {"chat_id": sender, "text": f"🎁 NFT получен: {base} #{num}. Он уже в вашем профиле в приложении.",
+        tg_api("sendMessage", {"chat_id": user_id, "text": f"🎁 NFT получен: {base} #{num}. Он уже в вашем профиле в приложении.",
                                "reply_markup": {"inline_keyboard": [[{"text": "Открыть", "web_app": {"url": APP_URL}}]]}})
     except Exception as e:
         print("nft notify error:", repr(e), flush=True)
+    return True
 
 
 _sub_ok = {}  # user_id -> время последней успешной проверки (кэш 60 с, чтобы не долбить Telegram)
@@ -357,6 +366,21 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self._send(400, {"error": "bad json"})
+        if self.path == "/api/userbot/nft":
+            # Приём NFT от юзербота (аккаунт без Premium). Защита: общий секрет USERBOT_SECRET в заголовке.
+            secret = os.environ.get("USERBOT_SECRET", "")
+            got = self.headers.get("X-Userbot-Secret", "")
+            if not secret or not hmac.compare_digest(secret.encode(), got.encode()):
+                return self._send(403, {"error": "forbidden"})
+            try:
+                uid = int(body["user_id"])
+                credited = credit_nft(body["key"], uid, body.get("name"), body.get("base"), body.get("num"), body.get("model"))
+            except Exception:
+                return self._send(400, {"error": "bad payload"})
+            if body.get("account"):
+                kv_set("biz_username", str(body["account"])[:64])
+            return self._send(200, {"credited": credited})
+
         init_data = body.get("initData") or self.headers.get("X-Init-Data", "")
         user_id, reason = check_init_data(init_data)
         if not user_id:

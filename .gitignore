@@ -1,0 +1,5 @@
+*.session
+*.session-journal
+.env
+puma.db
+__pycache__/
