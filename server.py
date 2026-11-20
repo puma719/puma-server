@@ -1,7 +1,7 @@
 """Puma UP — сервер бота: приём оплаты Telegram Stars (XTR).
 Только стандартная библиотека Python 3.9+. Запуск:  BOT_TOKEN=... python3 server.py
 """
-import hashlib, hmac, json, os, sqlite3, threading, time, urllib.parse, urllib.request
+import hashlib, hmac, json, os, re, sqlite3, threading, time, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip('"').strip("'")
@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS credits(user_id INTEGER PRIMARY KEY, pending INTEGER 
 CREATE TABLE IF NOT EXISTS promo_codes(code TEXT PRIMARY KEY, min_dep INTEGER NOT NULL DEFAULT 0,
                                        reward INTEGER NOT NULL, max_uses INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS promo_used(user_id INTEGER, code TEXT, ts INTEGER, PRIMARY KEY(user_id, code));
+CREATE TABLE IF NOT EXISTS feed(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, item TEXT, ts INTEGER);
 """)
 db.commit()
 
@@ -46,6 +47,33 @@ def seed_promos():
 
 
 _promo_fails = {}
+
+# ---------- Лента LIVE: реальные выигрыши игроков ----------
+_feed_last = {}
+ITEM_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def user_display(init_data):
+    """Имя игрока берём из подписанных данных Telegram, а не от клиента."""
+    try:
+        u = json.loads(dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))["user"])
+        name = "@" + u["username"] if u.get("username") else (u.get("first_name") or "Игрок")
+        return str(name)[:32]
+    except Exception:
+        return "Игрок"
+
+
+def feed(user_id, name, item=None):
+    """Записывает выигрыш (не чаще раза в 3 секунды на игрока) и возвращает последние 14."""
+    now = time.time()
+    with _db_lock:
+        if item and ITEM_RE.match(str(item)) and now - _feed_last.get(user_id, 0) >= 3:
+            _feed_last[user_id] = now
+            db.execute("INSERT INTO feed(user_id,name,item,ts) VALUES(?,?,?,?)", (user_id, name, item, int(now)))
+            db.execute("DELETE FROM feed WHERE id NOT IN (SELECT id FROM feed ORDER BY id DESC LIMIT 200)")
+            db.commit()
+        rows = db.execute("SELECT user_id,name,item FROM feed ORDER BY id DESC LIMIT 14").fetchall()
+    return [{"n": n, "item": it, "me": uid == user_id} for uid, n, it in rows]
 
 
 def redeem_promo(user_id, code):
@@ -201,6 +229,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 print("INVOICE ERROR:", repr(e), flush=True)
                 return self._send(502, {"error": "telegram"})
+
+        if self.path == "/api/feed":
+            return self._send(200, {"items": feed(user_id, user_display(init_data), body.get("item"))})
 
         if self.path == "/api/promo":
             reward, err = redeem_promo(user_id, body.get("code"))
