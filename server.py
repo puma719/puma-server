@@ -1,7 +1,7 @@
 """Puma UP — сервер бота: приём оплаты Telegram Stars (XTR).
 Только стандартная библиотека Python 3.9+. Запуск:  BOT_TOKEN=... python3 server.py
 """
-import hashlib, hmac, json, os, re, sqlite3, threading, time, urllib.parse, urllib.request
+import hashlib, hmac, json, os, re, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip('"').strip("'")
@@ -10,6 +10,9 @@ ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://puma719.github.io")
 PORT = int(os.environ.get("PORT", "8080"))
 DB_PATH = os.environ.get("DB_PATH", "puma.db")
 MIN_STARS, MAX_STARS = 1, 100000
+# Канал, подписка на который нужна для бесплатного кейса. Бот должен быть АДМИНИСТРАТОРОМ этого канала,
+# иначе Telegram не отдаёт список подписчиков и проверка не сработает.
+SUB_CHANNEL = os.environ.get("SUB_CHANNEL", "@pumaup").strip()
 
 _db_lock = threading.Lock()
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -174,6 +177,37 @@ def tg_api(method, payload=None, timeout=30):
         return json.loads(r.read())
 
 
+_sub_ok = {}  # user_id -> время последней успешной проверки (кэш 60 с, чтобы не долбить Telegram)
+
+
+def is_subscribed(user_id):
+    """Подписан ли игрок на SUB_CHANNEL. Возвращает (подписан, текст ошибки).
+    Ошибка пустая, если Telegram ответил и игрок просто не подписан. При сбое проверки доступ НЕ даём."""
+    now = time.time()
+    if now - _sub_ok.get(user_id, 0) < 60:
+        return True, ""
+    try:
+        res = tg_api("getChatMember", {"chat_id": SUB_CHANNEL, "user_id": user_id}, timeout=10)
+    except urllib.error.HTTPError as e:
+        try:
+            desc = json.loads(e.read()).get("description", "")
+        except Exception:
+            desc = ""
+        print("SUB CHECK ERROR:", e.code, desc, flush=True)
+        if "user not found" in desc.lower() or "participant_id_invalid" in desc.lower():
+            return False, ""  # Telegram не знает такого участника — считаем неподписанным
+        return False, "Не удалось проверить подписку, попробуйте позже"
+    except Exception as e:
+        print("SUB CHECK ERROR:", repr(e), flush=True)
+        return False, "Не удалось проверить подписку, попробуйте позже"
+    r = res.get("result") or {}
+    st = r.get("status")
+    ok = st in ("creator", "administrator", "member") or (st == "restricted" and bool(r.get("is_member")))
+    if ok:
+        _sub_ok[user_id] = now
+    return ok, ""
+
+
 def check_init_data(init_data, max_age=86400):
     """Проверка подписи Telegram. Возвращает (user_id, причина): при успехе (id, ""), при отказе (None, текст)."""
     def fail(msg, detail=""):
@@ -292,6 +326,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/api/feed":
             return self._send(200, {"items": feed(user_id, user_display(init_data), body.get("item"))})
+
+        if self.path == "/api/subscribed":
+            ok, err = is_subscribed(user_id)
+            return self._send(200, {"subscribed": ok, "channel": SUB_CHANNEL, "error": err})
 
         if self.path == "/api/promo":
             reward, err = redeem_promo(user_id, body.get("code"))
