@@ -15,7 +15,12 @@ MIN_STARS, MAX_STARS = 1, 100000
 SUB_CHANNEL = os.environ.get("SUB_CHANNEL", "@pumaup").strip()
 # Принимаем и «pumaup», и «https://t.me/pumaup», и числовой id канала (-100...)
 SUB_CHANNEL = re.sub(r"^(https?://)?t\.me/", "", SUB_CHANNEL).lstrip("@")
-SUB_CHANNEL = SUB_CHANNEL if re.fullmatch(r"-?\d+", SUB_CHANNEL) else "@" + SUB_CHANNEL
+if re.fullmatch(r"-?\d+", SUB_CHANNEL):
+    # id канала без минуса и «100» (например 1234567890) Telegram не принимает: нужен вид -1001234567890
+    if not SUB_CHANNEL.startswith("-") and len(SUB_CHANNEL) >= 10:
+        SUB_CHANNEL = "-100" + SUB_CHANNEL
+else:
+    SUB_CHANNEL = "@" + SUB_CHANNEL
 
 _db_lock = threading.Lock()
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -517,22 +522,37 @@ def is_subscribed(user_id):
     now = time.time()
     if now - _sub_ok.get(user_id, 0) < 60:
         return True, ""
-    try:
-        res = tg_api("getChatMember", {"chat_id": SUB_CHANNEL, "user_id": user_id}, timeout=10)
-    except urllib.error.HTTPError as e:
+    res = None
+    for attempt in (1, 2):  # один повтор при временном сбое (таймаут, 429, 5xx)
         try:
-            desc = json.loads(e.read()).get("description", "")
-        except Exception:
-            desc = ""
-        print("SUB CHECK ERROR:", e.code, desc, "| канал:", SUB_CHANNEL, flush=True)
-        if "user not found" in desc.lower() or "participant_id_invalid" in desc.lower():
-            return False, ""  # Telegram не знает такого участника — считаем неподписанным
-        SUB_DIAG.update(status="error", detail=f"{e.code} {desc}".strip())
-        return False, "Не удалось проверить подписку, попробуйте позже"
-    except Exception as e:
-        print("SUB CHECK ERROR:", repr(e), flush=True)
-        SUB_DIAG.update(status="error", detail=repr(e))
-        return False, "Не удалось проверить подписку, попробуйте позже"
+            res = tg_api("getChatMember", {"chat_id": SUB_CHANNEL, "user_id": user_id}, timeout=10)
+            break
+        except urllib.error.HTTPError as e:
+            try:
+                desc = json.loads(e.read()).get("description", "")
+            except Exception:
+                desc = ""
+            low = desc.lower()
+            print("SUB CHECK ERROR:", e.code, desc, "| канал:", SUB_CHANNEL, flush=True)
+            if "user not found" in low or "participant_id_invalid" in low:
+                return False, ""  # Telegram не знает такого участника — считаем неподписанным
+            if attempt == 1 and (e.code == 429 or e.code >= 500):
+                time.sleep(1)
+                continue
+            if "chat not found" in low or "not enough rights" in low or "administrator" in low or "inaccessible" in low:
+                SUB_DIAG.update(status="bot_not_admin", detail=f"{e.code} {desc}".strip())
+                print(f"SUB CHECK CONFIG: бот должен быть АДМИНИСТРАТОРОМ канала {SUB_CHANNEL}; "
+                      "проверьте SUB_CHANNEL (@username или -100…) и права бота", flush=True)
+            else:
+                SUB_DIAG.update(status="error", detail=f"{e.code} {desc}".strip())
+            return False, "Не удалось проверить подписку, попробуйте позже"
+        except Exception as e:
+            print("SUB CHECK ERROR:", repr(e), flush=True)
+            if attempt == 1:
+                time.sleep(1)
+                continue
+            SUB_DIAG.update(status="error", detail=repr(e))
+            return False, "Не удалось проверить подписку, попробуйте позже"
     r = res.get("result") or {}
     st = r.get("status")
     SUB_DIAG.update(status="ok", detail="")  # Telegram ответил — проверка работает
