@@ -4,6 +4,8 @@
 import hashlib, hmac, json, math, os, re, secrets, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import fair  # честная игра: тот же файл игроки используют для проверки (см. fair.py и GET /fair.py)
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip('"').strip("'")
 APP_URL = os.environ.get("APP_URL", "https://puma719.github.io/puma-app/")
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://puma719.github.io")
@@ -44,6 +46,21 @@ CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY AUTOINCREMENT, use
                                        status TEXT NOT NULL DEFAULT 'pending', refunded INTEGER NOT NULL DEFAULT 0,
                                        ts INTEGER NOT NULL, upd INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS withdrawals_user ON withdrawals(user_id, id);
+""")
+db.commit()
+# Честная игра. fair_seeds: пара сидов игрока (revealed=1 после раскрытия server_seed), fair_bets: журнал ставок для проверки,
+# fair_chains: цепочки хэшей общих игр (root секретный, anchor публичный), fair_rounds: раунды Ракеты и Скачек с раскрытым seed.
+db.executescript("""
+CREATE TABLE IF NOT EXISTS fair_seeds(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, server_seed TEXT NOT NULL, commit_hash TEXT NOT NULL,
+                                      client_seed TEXT NOT NULL, nonce INTEGER NOT NULL DEFAULT 0, revealed INTEGER NOT NULL DEFAULT 0, ts INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS fair_seeds_user ON fair_seeds(user_id, revealed, id);
+CREATE TABLE IF NOT EXISTS fair_bets(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, seed_id INTEGER NOT NULL, nonce INTEGER NOT NULL,
+                                     game TEXT NOT NULL, params TEXT NOT NULL, result TEXT NOT NULL, ts INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS fair_bets_seed ON fair_bets(seed_id, nonce);
+CREATE TABLE IF NOT EXISTS fair_chains(id INTEGER PRIMARY KEY AUTOINCREMENT, game TEXT NOT NULL, anchor TEXT NOT NULL, root TEXT NOT NULL,
+                                       n INTEGER NOT NULL, ts INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS fair_rounds(game TEXT NOT NULL, round INTEGER NOT NULL, chain_id INTEGER NOT NULL, idx INTEGER NOT NULL, seed TEXT NOT NULL,
+                                       commit_hash TEXT NOT NULL, x REAL NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(game, round));
 """)
 db.commit()
 
@@ -157,11 +174,12 @@ def feed(user_id, name, item=None):
 # Состояние считается по часам при каждом запросе, отдельный поток не нужен.
 MP_GAMES = ("rocket", "race")
 MP_BET_MAX, MP_BANK_MAX = 15000, 15000      # как BET_MAX и BANK_MAX в приложении
-RK_RTP, RK_RATE = 90, 0.09                  # возврат игрокам, % и рост множителя exp(0.09 * t)
+RK_RTP, RK_RATE = fair.RK_RTP, 0.09         # возврат игрокам, % (задаётся в fair.py) и рост множителя exp(0.09 * t)
 RK_WAIT, RK_CRASH = 5.0, 2.5                # приём ставок и показ взрыва, секунд
 HR_WAIT, HR_RUN, HR_DONE, HR_MULT = 8.0, 7.0, 3.5, 3.8
 _mp_lock = threading.RLock()
-_mp = {g: {"round": 0, "phase": "wait", "t0": 0.0, "cp": 1.0, "win": 0, "seed": 0, "bets": {}, "prev": None, "hist": []}
+_mp = {g: {"round": 0, "phase": "wait", "t0": 0.0, "cp": 1.0, "win": 0, "seed": 0, "bets": {}, "prev": None, "hist": [],
+           "chain_id": 0, "idx": 0, "fseed": "", "commit": ""}
        for g in MP_GAMES}
 _mp_my = {}  # (игра, user_id) -> последние 10 ставок игрока, новые первыми
 
@@ -184,18 +202,16 @@ def mp_load_history():
             _mp[g]["hist"] = [round(r[0], 2) if g == "rocket" else int(r[0]) for r in rows]
 
 
-def _rk_crash_point():
-    r = secrets.randbelow(10 ** 9) / 10 ** 9
-    return min(500.0, max(1.0, math.floor(RK_RTP / (1 - r)) / 100))
-
-
 def _mp_new_round(g, now):
+    """Исход раунда определяется seed из заранее опубликованной цепочки хэшей (см. fair.py): сервер не выбирает его под ставки.
+    Игрокам во время ставок виден только commit (хэш seed), сам seed раскрывается после раунда."""
     s = _mp[g]
-    s.update(round=max(s["round"] + 1, int(now * 1000)), phase="wait", t0=now, bets={})
+    cid, idx, seed, com = fair_next_round(g)
+    s.update(round=max(s["round"] + 1, int(now * 1000)), phase="wait", t0=now, bets={}, chain_id=cid, idx=idx, fseed=seed, commit=com)
     if g == "rocket":
-        s["cp"] = _rk_crash_point()  # точка взрыва известна только серверу и уходит клиентам после взрыва
+        s["cp"] = fair.rocket_point(seed)  # точка взрыва известна только серверу и уходит клиентам после взрыва
     else:
-        s["win"], s["seed"] = secrets.randbelow(4), secrets.randbelow(2 ** 31)
+        s["win"], s["seed"] = fair.race_winner(seed), fair.race_anim_seed(seed)
 
 
 def _mp_end(g, s):
@@ -238,7 +254,8 @@ def _mp_settle(g, s):
     x = round(s["cp"], 2) if g == "rocket" else s["win"]
     ts = int(s["t0"])
     bets = sorted(s["bets"].items(), key=lambda kv: -kv[1]["bet"])
-    s["prev"] = {"round": s["round"], "x": x, "bets": [dict(_mp_pub(g, b, False), u=uid) for uid, b in bets]}
+    s["prev"] = {"round": s["round"], "x": x, "fseed": s["fseed"], "commit": s["commit"], "idx": s["idx"],
+                 "bets": [dict(_mp_pub(g, b, False), u=uid) for uid, b in bets]}
     s["hist"].insert(0, x)
     del s["hist"][15:]
     for uid, b in bets:
@@ -247,6 +264,8 @@ def _mp_settle(g, s):
         del lst[10:]
     with _db_lock:
         db.execute("INSERT INTO mp_rounds(game,x,ts) VALUES(?,?,?)", (g, x, ts))
+        db.execute("INSERT OR IGNORE INTO fair_rounds(game,round,chain_id,idx,seed,commit_hash,x,ts) VALUES(?,?,?,?,?,?,?,?)",
+                   (g, s["round"], s["chain_id"], s["idx"], s["fseed"], s["commit"], float(x), ts))
         if bets:
             db.executemany("INSERT INTO mp_bets(game,round,user_id,name,bet,pick,cash,x,ts) VALUES(?,?,?,?,?,?,?,?,?)",
                            [(g, s["round"], uid, b["name"], b["bet"], b["pick"], b["cash"], x, ts) for uid, b in bets])
@@ -283,7 +302,10 @@ def mp_state(user_id, g):
         s = _mp[g]
         ph = s["phase"]
         out = {"now": int(now * 1000), "game": g, "round": s["round"], "phase": ph, "t0": int(s["t0"] * 1000),
-               "wait": int((RK_WAIT if g == "rocket" else HR_WAIT) * 1000), "hist": list(s["hist"])}
+               "wait": int((RK_WAIT if g == "rocket" else HR_WAIT) * 1000), "hist": list(s["hist"]),
+               "commit": s["commit"], "idx": s["idx"]}
+        if ph == ("crash" if g == "rocket" else "done"):  # seed раунда раскрывается только после его окончания
+            out["fseed"] = s["fseed"]
         if g == "rocket":
             if ph == "crash":
                 out["cp"] = round(s["cp"], 2)
@@ -299,7 +321,7 @@ def mp_state(user_id, g):
         mine = s["bets"].get(user_id)
         out["mine"] = _mp_pub(g, mine, True) if mine else None
         prev = s["prev"]
-        out["prev"] = None if not prev else {"round": prev["round"], "x": prev["x"],
+        out["prev"] = None if not prev else {"round": prev["round"], "x": prev["x"], "fseed": prev["fseed"], "commit": prev["commit"], "idx": prev["idx"],
                                              "bets": [{k: v for k, v in b.items() if k != "u"} | {"me": b["u"] == user_id} for b in prev["bets"]]}
         out["my"] = [dict(r) for r in _mp_my_list(g, user_id)]
     out["online"] = online(user_id, g).get(g, 0)
@@ -789,8 +811,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == "/health":
+        url = urllib.parse.urlparse(self.path)
+        if url.path == "/health":
             return self._send(200, {"ok": True, "sub": SUB_DIAG["status"], "sub_detail": SUB_DIAG["detail"]})
+        # Публичные данные честной игры: якоря цепочек, раскрытые раунды и точный код проверки, который работает на сервере.
+        if url.path == "/api/fair/info":
+            return self._send(200, fair_info())
+        if url.path == "/api/fair/rounds":
+            g = (urllib.parse.parse_qs(url.query).get("game") or [""])[0]
+            return self._send(200, {"rounds": fair_rounds(g)}) if g in MP_GAMES else self._send(400, {"error": "bad game"})
+        if url.path == "/fair.py":
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fair.py"), "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -857,6 +896,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, mp_cash(user_id, body.get("at")))
             return self._send(404, {"error": "not found"})
 
+        if self.path == "/api/fair/state":
+            return self._send(200, fair_state(user_id))
+
+        if self.path == "/api/fair/bet":
+            res, err = fair_bet(user_id, str(body.get("game") or ""), body.get("params"))
+            return self._send(200, res) if res else self._send(400, {"error": err})
+
+        if self.path == "/api/fair/rotate":
+            res, err = fair_rotate(user_id, body.get("client_seed"))
+            return self._send(200, res) if res else self._send(400, {"error": err})
+
+        if self.path == "/api/fair/bets":
+            res = fair_seed_bets(user_id, body.get("seed_id"))
+            return self._send(200, res) if res else self._send(404, {"error": "not found"})
+
         if self.path == "/api/online":
             return self._send(200, {"counts": online(user_id, body.get("game"))})
 
@@ -901,6 +955,156 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
+
+# ---------- Честная игра (описание и проверка: fair.py) ----------
+_chains = {}      # игра -> {"id": номер цепочки, "chain": HashChain, "idx": последний выданный раунд}
+_fair_rate = {}   # user_id -> времена последних ставок (защита журнала от флуда)
+
+
+def _chain_new(g):
+    root = fair.new_chain_root()
+    ch = fair.HashChain(root)
+    with _db_lock:
+        cur = db.execute("INSERT INTO fair_chains(game,anchor,root,n,ts) VALUES(?,?,?,?,?)", (g, ch.anchor, root, ch.n, int(time.time())))
+        db.commit()
+        cid = cur.lastrowid
+    print("FAIR CHAIN:", g, "id", cid, "anchor", ch.anchor, flush=True)
+    return {"id": cid, "chain": ch, "idx": 0}
+
+
+def _chain_load(g):
+    """Цепочка игры из базы (секретный корень лежит там же) или новая, если её ещё нет."""
+    with _db_lock:
+        row = db.execute("SELECT id,root,n FROM fair_chains WHERE game=? ORDER BY id DESC LIMIT 1", (g,)).fetchone()
+    if row is None:
+        return _chain_new(g)
+    return {"id": row[0], "chain": fair.HashChain(row[1], row[2]), "idx": int(kv_get(f"chain_idx:{g}:{row[0]}", "0") or 0)}
+
+
+def fair_init():
+    for g in MP_GAMES:
+        _chains[g] = _chain_load(g)
+        print("FAIR ANCHOR:", g, _chains[g]["chain"].anchor, flush=True)
+
+
+def fair_next_round(g):
+    """Следующий раунд цепочки: (id цепочки, номер, seed, commit). Номер записывается до выдачи, поэтому seed не используется дважды.
+    Если сервер перезапустился посреди раунда, его номер остаётся пропущенным: цепочка от этого не ломается."""
+    c = _chains.get(g)
+    if c is None:
+        c = _chains[g] = _chain_load(g)
+    if c["idx"] + 1 > c["chain"].n:  # цепочка кончилась: начинаем новую, её якорь тоже публичный
+        c = _chains[g] = _chain_new(g)
+    c["idx"] += 1
+    kv_set(f"chain_idx:{g}:{c['id']}", c["idx"])
+    ch = c["chain"]
+    return c["id"], c["idx"], ch.seed(c["idx"]), ch.seed(c["idx"] - 1)
+
+
+def _fair_create(user_id, client_seed):
+    """Новая пара сидов игрока. Вызывать под _db_lock."""
+    seed = fair.new_server_seed()
+    cur = db.execute("INSERT INTO fair_seeds(user_id,server_seed,commit_hash,client_seed,nonce,revealed,ts) VALUES(?,?,?,?,0,0,?)",
+                     (user_id, seed, fair.commit(seed), client_seed, int(time.time())))
+    db.commit()
+    return (cur.lastrowid, seed, fair.commit(seed), client_seed, 0)
+
+
+def _fair_active(user_id):
+    """Активная пара сидов (id, server_seed, commit, client_seed, nonce); создаётся при первом обращении. Вызывать под _db_lock."""
+    row = db.execute("SELECT id,server_seed,commit_hash,client_seed,nonce FROM fair_seeds WHERE user_id=? AND revealed=0 ORDER BY id DESC LIMIT 1",
+                     (user_id,)).fetchone()
+    return row or _fair_create(user_id, secrets.token_hex(6))
+
+
+def _fair_bets(seed_id, limit, newest_first=True):
+    rows = db.execute(f"SELECT nonce,game,params,result,ts FROM fair_bets WHERE seed_id=? ORDER BY nonce {'DESC' if newest_first else 'ASC'} LIMIT ?",
+                      (seed_id, limit)).fetchall()
+    return [{"nonce": n, "game": g, "params": json.loads(p), "result": json.loads(r), "ts": t} for n, g, p, r, t in rows]
+
+
+def fair_state(user_id):
+    """Что видит игрок: хэш текущего server_seed, свой client_seed, номер следующей ставки, последние ставки и раскрытые сиды."""
+    with _db_lock:
+        sid, _, com, cs, nonce = _fair_active(user_id)
+        bets = _fair_bets(sid, 30)
+        old = db.execute("SELECT id,server_seed,commit_hash,client_seed,nonce,ts FROM fair_seeds WHERE user_id=? AND revealed=1 ORDER BY id DESC LIMIT 10",
+                         (user_id,)).fetchall()
+    return {"commit": com, "client_seed": cs, "nonce": nonce, "bets": bets,
+            "revealed": [{"id": i, "server_seed": s, "commit": c, "client_seed": k, "bets_count": n, "ts": t} for i, s, c, k, n, t in old]}
+
+
+def fair_bet(user_id, game, params):
+    """Бросок для одной ставки. Результат считается из текущей пары сидов и номера ставки и пишется в журнал. Возвращает (ответ, ошибка)."""
+    now = time.time()
+    hits = [t for t in _fair_rate.get(user_id, []) if now - t < 10]
+    if len(hits) >= 40:
+        return None, "Слишком часто, подождите немного"
+    hits.append(now)
+    if len(_fair_rate) > 5000:
+        _fair_rate.clear()
+    _fair_rate[user_id] = hits
+    try:
+        p = fair.clean_params(game, params)
+    except ValueError:
+        return None, "Неверные параметры игры"
+    with _db_lock:
+        sid, seed, com, cs, nonce = _fair_active(user_id)
+        res = fair.outcome(game, p, fair.floats(seed, cs, nonce, 25))
+        db.execute("INSERT INTO fair_bets(user_id,seed_id,nonce,game,params,result,ts) VALUES(?,?,?,?,?,?,?)",
+                   (user_id, sid, nonce, game, json.dumps(p), json.dumps(res), int(now)))
+        db.execute("UPDATE fair_seeds SET nonce=nonce+1 WHERE id=?", (sid,))
+        db.commit()
+    return {"nonce": nonce, "commit": com, "client_seed": cs, "game": game, "params": p, "result": res}, ""
+
+
+def fair_rotate(user_id, client_seed=None):
+    """Раскрывает текущий server_seed (теперь по нему можно проверить все ставки) и начинает новую пару сидов.
+    Новый client_seed необязателен. Возвращает (состояние + раскрытый сид со всеми его ставками, ошибка)."""
+    cs = None
+    if client_seed is not None:
+        cs = str(client_seed).strip()
+        if not 1 <= len(cs) <= 64 or any(ord(ch) < 32 for ch in cs):
+            return None, "Клиентский сид: от 1 до 64 символов"
+    with _db_lock:
+        sid, seed, com, old_cs, nonce = _fair_active(user_id)
+        db.execute("UPDATE fair_seeds SET revealed=1 WHERE id=?", (sid,))
+        _fair_create(user_id, cs or old_cs)
+        bets = _fair_bets(sid, 1000, newest_first=False)
+    out = fair_state(user_id)
+    out["reveal"] = {"id": sid, "server_seed": seed, "commit": com, "client_seed": old_cs, "bets_count": nonce, "bets": bets}
+    return out, ""
+
+
+def fair_seed_bets(user_id, seed_id):
+    """Ставки уже раскрытого сида (для проверки). Чужие и ещё не раскрытые сиды не отдаются."""
+    try:
+        seed_id = int(seed_id)
+    except Exception:
+        return None
+    with _db_lock:
+        row = db.execute("SELECT server_seed,commit_hash,client_seed,nonce FROM fair_seeds WHERE id=? AND user_id=? AND revealed=1",
+                         (seed_id, user_id)).fetchone()
+        bets = _fair_bets(seed_id, 1000, newest_first=False) if row else []
+    if not row:
+        return None
+    return {"id": seed_id, "server_seed": row[0], "commit": row[1], "client_seed": row[2], "bets_count": row[3], "bets": bets}
+
+
+def fair_info():
+    with _db_lock:
+        rows = db.execute("SELECT id,game,anchor,n,ts FROM fair_chains ORDER BY id").fetchall()
+    return {"version": fair.VERSION, "rocket_rtp": fair.RK_RTP, "source": "/fair.py",
+            "chains": [{"id": i, "game": g, "anchor": a, "length": n, "ts": t} for i, g, a, n, t in rows]}
+
+
+def fair_rounds(game, limit=50):
+    with _db_lock:
+        rows = db.execute("SELECT round,chain_id,idx,seed,commit_hash,x,ts FROM fair_rounds WHERE game=? ORDER BY ts DESC, round DESC LIMIT ?",
+                          (game, max(1, min(int(limit), 200)))).fetchall()
+    return [{"round": r, "chain": c, "idx": i, "seed": s, "commit": k, "x": round(x, 2) if game == "rocket" else int(x), "ts": t}
+            for r, c, i, s, k, x, t in rows]
 
 
 # ---------- Бот: long polling ----------
@@ -963,6 +1167,7 @@ if __name__ == "__main__":
         raise SystemExit("Задайте переменную BOT_TOKEN (токен от @BotFather)")
     seed_promos()
     mp_load_history()
+    fair_init()
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=sub_diagnose, daemon=True).start()
     try:
