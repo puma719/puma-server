@@ -485,6 +485,26 @@ def credit_nft(key, user_id, name, base, num, model):
     return True
 
 
+def handle_credit_command(m):
+    """Ручное зачисление NFT админом: /credit <user_id> <название> <номер>  (например: /credit 123456789 Plush Pepe 1234).
+    Админы задаются переменной окружения ADMIN_IDS (Telegram ID через запятую; свой ID можно узнать командой /id)."""
+    chat_id = m["chat"]["id"]
+    uid = str((m.get("from") or {}).get("id"))
+    admins = {x.strip() for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
+    if uid not in admins:
+        return  # молча игнорируем: обычным пользователям команда недоступна
+    parts = str(m.get("text", "")).split()[1:]
+    usage = "Формат: /credit <ID игрока> <название NFT> <номер>\nПример: /credit 123456789 Plush Pepe 1234"
+    if len(parts) < 3 or not parts[0].lstrip("-").isdigit() or not parts[-1].isdigit():
+        tg_api("sendMessage", {"chat_id": chat_id, "text": usage})
+        return
+    target, num, name = int(parts[0]), int(parts[-1]), " ".join(parts[1:-1])
+    key = f"manual:{target}:{name}:{num}:{int(time.time())}"
+    ok = credit_nft(key, target, name, name, num, "")
+    tg_api("sendMessage", {"chat_id": chat_id, "text": f"✅ Зачислено: {name} #{num} → {target}" if ok else "⚠️ Не удалось зачислить"})
+    print("MANUAL CREDIT by", uid, "->", target, name, num, flush=True)
+
+
 _sub_ok = {}  # user_id -> время последней успешной проверки (кэш 60 с, чтобы не долбить Telegram)
 # Состояние проверки подписки для диагностики: видно в логах и на /health (ok / bot_not_admin / error + причина).
 SUB_DIAG = {"status": "unknown", "detail": ""}
@@ -758,7 +778,14 @@ def handle_update(u):
                 tg_api("sendMessage", {"chat_id": m["chat"]["id"],
                                        "text": f"✅ Оплата получена: +{sp['total_amount']} ⭐. Откройте приложение — баланс обновится."})
         return
-    if str(m.get("text", "")).startswith("/start"):
+    text = str(m.get("text", ""))
+    if text.startswith("/id"):
+        tg_api("sendMessage", {"chat_id": m["chat"]["id"], "text": f"Ваш ID: {(m.get('from') or {}).get('id')}"})
+        return
+    if text.startswith("/credit"):
+        handle_credit_command(m)
+        return
+    if text.startswith("/start"):
         tg_api("sendMessage", {"chat_id": m["chat"]["id"], "text": "Добро пожаловать в Puma UP!",
                                "reply_markup": {"inline_keyboard": [[{"text": "Открыть", "web_app": {"url": APP_URL}}]]}})
 
