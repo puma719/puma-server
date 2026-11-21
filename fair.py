@@ -96,7 +96,7 @@ def clean_params(game, p):
         w = p.get("weights")
         if not isinstance(w, list) or not 1 <= len(w) <= 64:
             raise ValueError("bad weights")
-        return {"weights": [_num(x, 1e-9, 1e9) for x in w]}
+        return {"weights": [_num(x, 1e-15, 1e9) for x in w]}
     if game == "mines":
         return {"count": _int(p.get("count"), 1, 24)}
     if game == "tower":
@@ -112,7 +112,10 @@ def outcome(game, params, f):
     if game == "upgrade":
         return {"r": f[0], "win": f[0] < params["chance"]}
     if game == "case":
-        r = f[0] * sum(params["weights"])
+        total = 0.0
+        for w in params["weights"]:  # обычное сложение слева направо (встроенный sum() в новых Python суммирует иначе)
+            total += w
+        r = f[0] * total
         for i, w in enumerate(params["weights"]):
             r -= w
             if r < 0:
