@@ -10,6 +10,8 @@ ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://puma719.github.io")
 PORT = int(os.environ.get("PORT", "8080"))
 DB_PATH = os.environ.get("DB_PATH", "puma.db")
 MIN_STARS, MAX_STARS = 1, 100000
+WD_MIN = int(os.environ.get("WD_MIN", "1050"))  # минимальная сумма вывода, должна совпадать с WD_MIN в приложении
+WD_MAX_PENDING = 5  # столько заявок на вывод игрок может держать «в обработке» одновременно
 # Канал, подписка на который нужна для бесплатного кейса. Бот должен быть АДМИНИСТРАТОРОМ этого канала,
 # иначе Telegram не отдаёт список подписчиков и проверка не сработает.
 SUB_CHANNEL = os.environ.get("SUB_CHANNEL", "@pumaup").strip()
@@ -38,6 +40,10 @@ CREATE TABLE IF NOT EXISTS mp_rounds(id INTEGER PRIMARY KEY AUTOINCREMENT, game 
 CREATE TABLE IF NOT EXISTS mp_bets(id INTEGER PRIMARY KEY AUTOINCREMENT, game TEXT, round INTEGER, user_id INTEGER, name TEXT,
                                    bet INTEGER, pick INTEGER, cash REAL, x REAL, ts INTEGER);
 CREATE INDEX IF NOT EXISTS mp_bets_user ON mp_bets(user_id, game, id);
+CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount INTEGER NOT NULL,
+                                       status TEXT NOT NULL DEFAULT 'pending', refunded INTEGER NOT NULL DEFAULT 0,
+                                       ts INTEGER NOT NULL, upd INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS withdrawals_user ON withdrawals(user_id, id);
 """)
 db.commit()
 
@@ -631,6 +637,134 @@ def claim(user_id):
         return n
 
 
+# ---------- Заявки на вывод ----------
+# Баланс хранится в приложении, поэтому сервер не списывает и не возвращает звёзды сам: он ведёт статус заявки.
+# pending → paid (админ выплатил, отменить уже нельзя) или pending → cancelled (отмена игроком или админом).
+# Возврат звёзд по отменённой заявке выдаётся ровно один раз: флаг refunded переключается атомарно в wd_refund().
+def admin_ids():
+    return [int(x) for x in (s.strip() for s in os.environ.get("ADMIN_IDS", "").split(",")) if x.lstrip("-").isdigit()]
+
+
+def notify(chat_id, text):
+    try:
+        tg_api("sendMessage", {"chat_id": chat_id, "text": text})
+    except Exception as e:
+        print("notify error:", chat_id, repr(e), flush=True)
+
+
+def wd_item(row):
+    wid, amount, status, refunded, ts = row
+    return {"id": wid, "amount": amount, "status": status, "refunded": bool(refunded), "ts": ts}
+
+
+def wd_create(user_id, amount):
+    """Создаёт заявку. Возвращает (заявка, ошибка)."""
+    try:
+        amount = int(amount)
+    except Exception:
+        return None, "bad amount"
+    if amount < WD_MIN:
+        return None, f"минимальная сумма вывода: {WD_MIN}"
+    if amount > 10_000_000:
+        return None, "слишком большая сумма"
+    now = int(time.time())
+    with _db_lock:
+        pending = db.execute("SELECT COUNT(*) FROM withdrawals WHERE user_id=? AND status='pending'", (user_id,)).fetchone()[0]
+        if pending >= WD_MAX_PENDING:
+            return None, "слишком много заявок в обработке"
+        cur = db.execute("INSERT INTO withdrawals(user_id,amount,status,refunded,ts,upd) VALUES(?,?,'pending',0,?,?)",
+                         (user_id, amount, now, now))
+        db.commit()
+        wid = cur.lastrowid
+    print("WITHDRAW NEW:", wid, user_id, amount, flush=True)
+    for a in admin_ids():
+        notify(a, f"💸 Заявка на вывод #{wid}: {amount} ⭐ от игрока {user_id}\nВыплатили: /paid {wid}\nОтменить: /wdcancel {wid}")
+    return {"id": wid, "amount": amount, "status": "pending", "refunded": False, "ts": now}, ""
+
+
+def wd_list(user_id):
+    with _db_lock:
+        rows = db.execute("SELECT id,amount,status,refunded,ts FROM withdrawals WHERE user_id=? ORDER BY id DESC LIMIT 30",
+                          (user_id,)).fetchall()
+    return [wd_item(r) for r in rows]
+
+
+def wd_cancel(user_id, wid, by_admin=False):
+    """Отмена заявки в статусе pending. Повторная отмена уже отменённой заявки безопасна. Возвращает (статус, ошибка)."""
+    try:
+        wid = int(wid)
+    except Exception:
+        return None, "bad id"
+    with _db_lock:
+        row = db.execute("SELECT user_id,status FROM withdrawals WHERE id=?", (wid,)).fetchone()
+        if not row or (not by_admin and row[0] != user_id):
+            return None, "заявка не найдена"
+        if row[1] == "paid":
+            return None, "вывод уже выплачен, отменить нельзя"
+        if row[1] == "pending":
+            db.execute("UPDATE withdrawals SET status='cancelled', upd=? WHERE id=? AND status='pending'", (int(time.time()), wid))
+            db.commit()
+            print("WITHDRAW CANCEL:", wid, "by", "admin" if by_admin else "player", flush=True)
+    return "cancelled", ""
+
+
+def wd_refund(user_id, wid):
+    """Сколько звёзд вернуть игроку по отменённой заявке. Ненулевое значение выдаётся один раз."""
+    try:
+        wid = int(wid)
+    except Exception:
+        return 0
+    with _db_lock:
+        cur = db.execute("UPDATE withdrawals SET refunded=1, upd=? WHERE id=? AND user_id=? AND status='cancelled' AND refunded=0",
+                         (int(time.time()), wid, user_id))
+        if cur.rowcount != 1:
+            db.rollback()
+            return 0
+        amount = db.execute("SELECT amount FROM withdrawals WHERE id=?", (wid,)).fetchone()[0]
+        db.commit()
+    print("WITHDRAW REFUND:", wid, user_id, amount, flush=True)
+    return amount
+
+
+def handle_wd_command(m):
+    """Команды админа: /withdrawals (заявки в обработке), /paid <№> (выплачено), /wdcancel <№> (отменить заявку)."""
+    chat_id = m["chat"]["id"]
+    if str((m.get("from") or {}).get("id")) not in {str(a) for a in admin_ids()}:
+        return  # обычным пользователям команды недоступны
+    parts = str(m.get("text", "")).split()
+    cmd = parts[0].split("@")[0]
+    if cmd == "/withdrawals":
+        with _db_lock:
+            rows = db.execute("SELECT id,user_id,amount,ts FROM withdrawals WHERE status='pending' ORDER BY id LIMIT 50").fetchall()
+        text = "\n".join(f"#{i}: {a} ⭐ · игрок {u} · /paid {i}" for i, u, a, _ in rows) or "Заявок в обработке нет"
+        return notify(chat_id, text)
+    if len(parts) < 2 or not parts[1].isdigit():
+        return notify(chat_id, f"Формат: {cmd} <номер заявки>")
+    wid = int(parts[1])
+    if cmd == "/paid":
+        with _db_lock:
+            cur = db.execute("UPDATE withdrawals SET status='paid', upd=? WHERE id=? AND status='pending'", (int(time.time()), wid))
+            row = db.execute("SELECT user_id,amount,status FROM withdrawals WHERE id=?", (wid,)).fetchone()
+            db.commit()
+        if not row:
+            return notify(chat_id, "Заявка не найдена")
+        if cur.rowcount != 1:
+            return notify(chat_id, f"Заявка #{wid} уже в статусе «{row[2]}», отметить выплаченной нельзя")
+        print("WITHDRAW PAID:", wid, "by", (m.get("from") or {}).get("id"), flush=True)
+        notify(chat_id, f"✅ Заявка #{wid} отмечена выплаченной ({row[1]} ⭐ → {row[0]})")
+        return notify(row[0], f"✅ Вывод {row[1]} ⭐ выплачен.")
+    if cmd == "/wdcancel":
+        with _db_lock:
+            row = db.execute("SELECT user_id,amount FROM withdrawals WHERE id=?", (wid,)).fetchone()
+        if not row:
+            return notify(chat_id, "Заявка не найдена")
+        st, err = wd_cancel(row[0], wid, by_admin=True)
+        if err:
+            return notify(chat_id, f"⚠️ {err}")
+        notify(chat_id, f"↩️ Заявка #{wid} отменена, звёзды вернутся игроку {row[0]} при следующем открытии приложения")
+        return notify(row[0], f"↩️ Вывод {row[1]} ⭐ отменён. Звёзды вернутся на баланс при открытии приложения.")
+
+
 # ---------- HTTP API для приложения ----------
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, obj):
@@ -749,6 +883,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/claim":
             return self._send(200, {"credited": claim(user_id)})
 
+        if self.path == "/api/withdraw":
+            w, err = wd_create(user_id, body.get("amount"))
+            return self._send(200, {"withdrawal": w}) if w else self._send(400, {"error": err})
+
+        if self.path == "/api/withdrawals":
+            return self._send(200, {"items": wd_list(user_id)})
+
+        if self.path == "/api/withdraw/cancel":
+            st, err = wd_cancel(user_id, body.get("id"))
+            return self._send(200, {"status": st}) if st else self._send(400, {"error": err})
+
+        if self.path == "/api/withdraw/refund":
+            return self._send(200, {"refund": wd_refund(user_id, body.get("id"))})
+
         self._send(404, {"error": "not found"})
 
     def log_message(self, *a):
@@ -784,6 +932,9 @@ def handle_update(u):
         return
     if text.startswith("/credit"):
         handle_credit_command(m)
+        return
+    if text.split(" ")[0].split("@")[0] in ("/withdrawals", "/paid", "/wdcancel"):
+        handle_wd_command(m)
         return
     if text.startswith("/start"):
         tg_api("sendMessage", {"chat_id": m["chat"]["id"], "text": "Добро пожаловать в Puma UP!",
